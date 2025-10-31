@@ -1,7 +1,9 @@
 espn-api
-nba_api
+nba-api
 pandas
+python-dotenv
 requests
 schedule
 scipy
 tabulate
+zoneinfo

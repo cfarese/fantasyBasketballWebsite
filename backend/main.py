@@ -10,6 +10,7 @@ from tabulate import tabulate
 import pandas as pd
 import subprocess
 import datetime
+from zoneinfo import ZoneInfo
 from nba_api.stats.endpoints import scoreboardv2
 import unicodedata
 
@@ -100,8 +101,13 @@ def get_scoring_period_date(scoring_period):
 def get_teams_playing_for_period(scoring_period):
     """
     Get all teams playing during a given scoring period (one day).
-    Returns a set of team tricodes.
+    Returns a tuple: (teams_playing_set, teams_finished_set, team_game_times_dict)
+    - teams_playing_set: teams scheduled to play this day
+    - teams_finished_set: teams whose games have already finished (based on current time)
+    - team_game_times_dict: mapping of team tricode -> game start datetime
     """
+    from zoneinfo import ZoneInfo
+    
     # NBA team ID to tricode mapping
     nba_team_id_to_tricode = {
         1610612737: 'ATL', 1610612738: 'BOS', 1610612739: 'CLE', 1610612740: 'NOP',
@@ -115,10 +121,16 @@ def get_teams_playing_for_period(scoring_period):
     }
     
     teams_playing = set()
+    teams_finished = set()
+    team_game_times = {}  # New: store game start times
     period_date = get_scoring_period_date(scoring_period)
     #print(f"\n=== DEBUG: get_teams_playing_for_period ===")
     #print(f"Scoring period: {scoring_period}")
     #print(f"Period date: {period_date}")
+    
+    # Get current time in EST
+    now_est = datetime.datetime.now(ZoneInfo('America/New_York'))
+    #print(f"Current time (EST): {now_est}")
     
     # Check games on this specific day only
     date_str = period_date.strftime('%m/%d/%Y')
@@ -134,21 +146,70 @@ def get_teams_playing_for_period(scoring_period):
             # Extract team IDs from game data (indices 6 and 7 are home/away team IDs)
             home_team_id = game[6]
             away_team_id = game[7]
+            # Game status is at index 4: shows time like "8:00 pm ET"
+            game_status = game[4] if len(game) > 4 else ""
             
             # Convert team IDs to tricodes
             home_tricode = nba_team_id_to_tricode.get(home_team_id, None)
             away_tricode = nba_team_id_to_tricode.get(away_team_id, None)
             
-            #print(f"    Game: {home_tricode} (ID: {home_team_id}) vs {away_tricode} (ID: {away_team_id})")
+            #print(f"    Game: {home_tricode} vs {away_tricode}, Status: '{game_status}'")
+            
+            # Parse game time
+            game_time = None
+            import re
+            time_match = re.search(r'(\d+):(\d+)\s*(am|pm)', game_status.lower())
+            if time_match:
+                hour = int(time_match.group(1))
+                minute = int(time_match.group(2))
+                is_pm = time_match.group(3) == 'pm'
+                
+                # Convert to 24-hour format
+                if is_pm and hour != 12:
+                    hour += 12
+                elif not is_pm and hour == 12:
+                    hour = 0
+                
+                # Create game time
+                game_time = datetime.datetime.combine(period_date, datetime.time(hour, minute))
+                game_time = game_time.replace(tzinfo=ZoneInfo('America/New_York'))
+            
+            # Check if game has finished by comparing current time to period date
+            game_is_finished = False
+            if period_date < now_est.date():
+                # Game was on a previous date, definitely finished
+                game_is_finished = True
+                #print(f"      -> Game date {period_date} is before today {now_est.date()}, game is FINISHED")
+            elif period_date == now_est.date() and game_time:
+                # Game is today - check if it's been 3+ hours since start (game should be over)
+                time_since_game = (now_est - game_time).total_seconds() / 3600
+                if time_since_game >= 3:
+                    game_is_finished = True
+                    #print(f"      -> {time_since_game:.1f} hours since game start, game is FINISHED")
+                else:
+                    pass
+                    #print(f"      -> Only {time_since_game:.1f} hours since game start, game still active")
             
             if home_tricode:
                 teams_playing.add(home_tricode)
+                if game_time:
+                    team_game_times[home_tricode] = game_time
+                if game_is_finished:
+                    teams_finished.add(home_tricode)
             if away_tricode:
                 teams_playing.add(away_tricode)
+                if game_time:
+                    team_game_times[away_tricode] = game_time
+                if game_is_finished:
+                    teams_finished.add(away_tricode)
     except Exception as e:
         # If the API fails for a future date or other reason, continue
         print(f"  ERROR: Could not fetch games for {date_str}: {e}")
         pass
+    
+    #print(f"\nTotal teams playing on this date: {teams_playing}")
+    #print(f"Teams with finished games: {teams_finished}")
+    return teams_playing, teams_finished, team_game_times
     
     #print(f"\nTotal teams playing on this date: {teams_playing}")
     return teams_playing
@@ -261,8 +322,9 @@ def matchup_comparison(box_id, scoringperiod):
             team2_name = leagueteam.team_name
 
     # Get teams playing during this scoring period
-    teams_playing = get_teams_playing_for_period(scoringperiod)
+    teams_playing, teams_finished, team_game_times = get_teams_playing_for_period(scoringperiod)
     #print(f"Teams playing in scoring period {scoringperiod}: {teams_playing}")
+    #print(f"Teams with finished games: {teams_finished}")
     
     # ESPN pro team ID to NBA tricode mapping
     espn_team_mapping = {
@@ -286,30 +348,41 @@ def matchup_comparison(box_id, scoringperiod):
         player_team_tricode = espn_team_mapping.get(pro_team_id, None)
         #print(f"  Mapped to NBA tricode: {player_team_tricode}")
         
+        # Check if player has 0 points AND game started 2+ hours ago
+        if player.get('points', 0) == 0 and player_team_tricode in team_game_times:
+            now_est = datetime.datetime.now(ZoneInfo('America/New_York'))
+            hours_since_start = (now_est - team_game_times[player_team_tricode]).total_seconds() / 3600
+            if hours_since_start >= 2:
+                #print(f"  -> Setting projection to 0 (0 points, 2+ hours since game start)")
+                player["Projection"] = 0
+                continue
+        
+        # Check if player's team game has finished
+        game_finished = player_team_tricode and player_team_tricode in teams_finished
+        #print(f"  Game finished? {game_finished}")
+        
+        # If the game has finished, projection should always be 0 (actual points are already recorded)
+        if game_finished:
+            #print(f"  -> Setting projection to 0 (Game finished)")
+            player["Projection"] = 0
+            continue
+        
         # Check if player's team is playing during this scoring period
         is_playing = player_team_tricode and player_team_tricode in teams_playing
         #print(f"  Is team in teams_playing? {player_team_tricode in teams_playing if player_team_tricode else 'N/A (no tricode)'}")
         #print(f"  is_playing: {is_playing}")
 
-        # Check if player is OUT - set projection to 0 ONLY if they haven't already played (points == 0)
+        # Check if player is OUT - set projection to 0 if they haven't played yet
         if player["name"] in injury_dict and injury_dict[player["name"]] == "OUT":
-            if player.get("points", 0) == 0:  # Only zero out projection if game hasn't been played yet
-                #print(f"  -> Setting projection to 0 (Player is OUT and hasn't played)")
-                player["Projection"] = 0
-                continue
-            else:
-                #print(f"  -> Player is OUT now but already played (has {player['points']} points), keeping projection")
-                pass  # Continue to assign projection normally
+            #print(f"  -> Setting projection to 0 (Player is OUT)")
+            player["Projection"] = 0
+            continue
         
-        # If player's team is not playing, set projection to 0 ONLY if they haven't already played
+        # If player's team is not playing, set projection to 0
         if not is_playing:
-            if player.get("points", 0) == 0:  # Only zero out if game hasn't been played yet
-                #print(f"  -> Setting projection to 0 (Team not playing)")
-                player["Projection"] = 0
-                continue
-            else:
-                #print(f"  -> Team not playing now but player already played (has {player['points']} points), keeping projection")
-                pass  # Continue to assign projection normally
+            #print(f"  -> Setting projection to 0 (Team not playing)")
+            player["Projection"] = 0
+            continue
 
         # Find player in projections
         player_row = df[df['Player_Standardized'] == player_name_std]
