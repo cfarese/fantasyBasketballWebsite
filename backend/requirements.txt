@@ -1,0 +1,7 @@
+espn-api
+nba_api
+pandas
+requests
+schedule
+scipy
+tabulate

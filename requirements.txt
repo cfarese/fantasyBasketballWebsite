@@ -1,0 +1,8 @@
+espn-api
+nba_api
+pandas
+python-dotenv
+requests
+schedule
+scipy
+tabulate
