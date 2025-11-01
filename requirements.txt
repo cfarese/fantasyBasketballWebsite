@@ -1,5 +1,5 @@
 espn-api
-nba-api
+nba_api
 pandas
 python-dotenv
 requests
